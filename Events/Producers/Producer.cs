@@ -1,13 +1,12 @@
-using System.Net;
 using System.Text.Json;
-using Azure.Storage.Queues;
+using System.Net;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 
 namespace azureFunctions.Events.Producers;
 
-public abstract class Producer
+public sealed class Producer
 {
     private const string QueueName = "incoming-requests";
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -16,7 +15,7 @@ public abstract class Producer
     };
 
     [Function("Producer")]
-    public async Task<HttpResponseData> RunAsync(
+    public async Task<ProducerOutput> RunAsync(
         [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData request,
         FunctionContext executionContext)
     {
@@ -31,28 +30,19 @@ public abstract class Producer
             {
                 error = "Le corps JSON doit contenir name et message."
             });
-            return badRequest;
-        }
-
-        var storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
-        if (string.IsNullOrWhiteSpace(storageConnectionString))
-        {
-            logger.LogError("AzureWebJobsStorage is not configured.");
-
-            var unavailable = request.CreateResponse(HttpStatusCode.InternalServerError);
-            await unavailable.WriteAsJsonAsync(new
+            return new ProducerOutput
             {
-                error = "La configuration de stockage est manquante."
-            });
-            return unavailable;
+                QueueMessage = string.Empty,
+                HttpResponse = badRequest
+            };
         }
 
-        var queueClient = new QueueClient(storageConnectionString, QueueName);
-        await queueClient.CreateIfNotExistsAsync();
+        var queueMessage = JsonSerializer.Serialize(new QueueMessage(
+            incomingRequest.Name.Trim(),
+            incomingRequest.Message.Trim(),
+            DateTimeOffset.UtcNow));
 
-        var queueMessage = new QueueMessage();
-
-        await queueClient.SendMessageAsync(JsonSerializer.Serialize(queueMessage));
+        logger.LogInformation("Queue message prepared for {QueueName}.", QueueName);
 
         var accepted = request.CreateResponse(HttpStatusCode.Accepted);
         await accepted.WriteAsJsonAsync(new
@@ -61,10 +51,23 @@ public abstract class Producer
             queue = QueueName
         });
 
-        return accepted;
+        return new ProducerOutput
+        {
+            QueueMessage = queueMessage,
+            HttpResponse = accepted
+        };
     }
 
     private sealed record IncomingRequest(string? Name, string? Message);
 
-    private sealed record QueueMessage;
+    private sealed record QueueMessage(string Name, string Message, DateTimeOffset EnqueuedAtUtc);
+
+    public sealed class ProducerOutput
+    {
+        [QueueOutput(QueueName, Connection = "AzureWebJobsStorage")]
+        public string QueueMessage { get; set; } = string.Empty;
+
+        [HttpResult]
+        public HttpResponseData HttpResponse { get; set; } = default!;
+    }
 }
